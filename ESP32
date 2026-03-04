@@ -1,0 +1,1112 @@
+/*
+ * ============================================================
+ * 双轴写字机器人控制器 - ESP32-S3稳定版（增大串口缓冲区）
+ * 功能：非阻塞脉冲方式，脉冲宽度20us，Z轴10°/110°
+ * ============================================================
+ */
+
+// ===== 电机参数 =====
+#define MICROSTEPS 32           // 驱动器细分：32细分
+
+// ===== 电子齿轮 =====
+#define PULSE_PER_MM 800.0      // 800脉冲/mm
+#define PULSE_PER_MM_INT 800    // 整数版本
+
+// ===== 速度参数 =====
+#define MAX_SPEED 30000         // 最大30000 Hz
+#define MIN_SPEED 100           // 最小100 Hz
+#define HOME_SPEED 2000         // 归零速度2000 Hz
+
+// ===== 加速度参数 =====
+#define ACCEL_TABLE_SIZE 100    // 加速度表大小
+#define ACCEL_STEPS 150         // 加速步数
+#define START_SPEED_DIV 5       // 起始速度 = 目标速度 / 5
+
+// ===== 任务参数 =====
+#define MAX_TASK_SIZE 96        // 32条指令/任务
+#define HOME_TIMEOUT 60000      // 归零超时(ms)
+#define MAX_DELAY_TIME 10000    // 最大延时(ms)
+
+// ===== 引脚定义 =====
+#define X_STEP_PIN 4
+#define X_DIR_PIN 5
+#define X_ENABLE_PIN 6
+#define X_LIMIT_MIN 7
+
+#define Y_STEP_PIN 8
+#define Y_DIR_PIN 9
+#define Y_ENABLE_PIN 10
+#define Y_LIMIT_MIN 11
+
+#define Z_SERVO_PIN 17
+
+// ===== 舵机角度 =====
+#define Z_UP_ANGLE 0           // 笔抬起角度 10°
+#define Z_DOWN_ANGLE 115        // 笔放下角度 110°
+
+// ===== 舵机参数 =====
+#define SERVO_MIN_PULSE 500
+#define SERVO_MAX_PULSE 2500
+#define SERVO_PERIOD 20000
+#define SERVO_SETTLE_TIME 300
+#define SERVO_PULSE_COUNT 8
+
+// ===== 系统参数 =====
+#define STEP_PULSE_WIDTH 20      // 脉冲宽度20us
+#define SERIAL_BAUD 115200
+#define SERIAL_RX_BUFFER_SIZE 2048  // 接收缓冲区2048字节
+#define SERIAL_TX_BUFFER_SIZE 2048  // 发送缓冲区2048字节
+
+// ===== 方向常量 =====
+#define DIR_POSITIVE HIGH
+#define DIR_NEGATIVE LOW
+
+// ===== 非阻塞脉冲状态 =====
+struct PulseState {
+  bool active;
+  uint32_t startTime;
+  bool xPending;
+  bool yPending;
+  bool xStepDone;
+  bool yStepDone;
+};
+
+PulseState pulseState = {false, 0, false, false, false, false};
+
+// ===== 轴状态 =====
+struct AxisState {
+  uint8_t stepPin;
+  uint8_t dirPin;
+  uint8_t enablePin;
+  uint8_t limitPin;
+  volatile int32_t currentPosition;
+  bool homed;
+  bool enabled;
+  int8_t currentDirection;
+};
+
+struct ZAxisState {
+  bool isUp;
+  int upAngle;
+  int downAngle;
+  int currentAngle;
+  int targetAngle;
+  uint32_t lastPulseTime;
+  uint32_t lastMoveTime;
+  bool moving;
+};
+
+enum CommandType {
+  CMD_G01 = 1,
+  CMD_G04 = 2,
+  CMD_G28 = 3,
+  CMD_M03 = 4,
+  CMD_M05 = 5
+};
+
+struct Command {
+  int32_t x, y;
+  uint16_t f;
+  uint16_t dwell;
+  uint8_t type;
+};
+
+struct Task {
+  Command commands[MAX_TASK_SIZE];
+  uint16_t commandCount;
+  uint16_t currentIndex;
+  bool active;
+  char taskId[20];
+};
+
+struct MoveState {
+  int32_t targetX, targetY;
+  int32_t dx, dy, steps, err;
+  volatile uint32_t step_count;
+  
+  uint16_t target_interval;
+  volatile uint16_t current_interval;
+  uint16_t start_interval;
+  
+  uint16_t target_speed;
+  int8_t step_x, step_y;
+  
+  volatile bool active;
+  uint32_t lastStepTime;
+  uint32_t nextStepTime;
+  
+  uint16_t accel_half;
+  uint16_t accel_phase;
+  uint8_t move_phase;
+};
+
+// ===== 全局变量 =====
+AxisState xAxis = {X_STEP_PIN, X_DIR_PIN, X_ENABLE_PIN, X_LIMIT_MIN, 0, false, false, 0};
+AxisState yAxis = {Y_STEP_PIN, Y_DIR_PIN, Y_ENABLE_PIN, Y_LIMIT_MIN, 0, false, false, 0};
+ZAxisState zAxis = {true, Z_UP_ANGLE, Z_DOWN_ANGLE, Z_UP_ANGLE, Z_UP_ANGLE, 0, 0, false};
+Task currentTask = {0};
+MoveState moveState = {0};
+
+uint16_t accel_table[ACCEL_TABLE_SIZE + 1];
+
+char inputBuffer[1024];
+uint16_t bufferIndex = 0;
+bool stringComplete = false;
+
+enum SystemState {
+  STATE_IDLE, 
+  STATE_HOMING, 
+  STATE_MOVING, 
+  STATE_EXECUTING, 
+  STATE_Z_MOVING, 
+  STATE_DWELL
+};
+
+SystemState systemState = STATE_IDLE;
+bool waitingForMoveComplete = false;
+bool waitingForHomeComplete = false;
+bool waitingForZComplete = false;
+bool waitingForDwellComplete = false;
+
+uint32_t dwellStartTime = 0;
+uint16_t dwellDuration = 0;
+
+// ==================== 函数声明 ====================
+void initAccelTable();
+uint16_t getAccelValue(uint16_t step, uint16_t total);
+void updateServo();
+void zUp();
+void zDown();
+void setDirection(AxisState* axis, int8_t direction);
+void enableAxis(AxisState* axis, bool enable);
+bool readLimit(AxisState* axis);
+void startMove(int32_t targetX, int32_t targetY, uint16_t speedHz);
+void processMove();
+void startHoming();
+bool parseTask(char* data);
+void startNewTask();
+void executeNextCommand();
+void startDwell(uint16_t ms);
+void resetSystem();
+void emergencyStop();
+void reportPosition();
+void reportStatus();
+void processCommand(char* cmd);
+void testPulse();
+
+// ==================== 预计算加速度表 ====================
+
+void initAccelTable() {
+  for (int i = 0; i <= ACCEL_TABLE_SIZE; i++) {
+    float t = (float)i / ACCEL_TABLE_SIZE;
+    float smooth = t * t * t * (10.0f - 15.0f * t + 6.0f * t * t);
+    accel_table[i] = (uint16_t)(smooth * 1024.0f);
+  }
+}
+
+uint16_t getAccelValue(uint16_t step, uint16_t total) {
+  if (total == 0) return 1024;
+  uint16_t index = (step * ACCEL_TABLE_SIZE) / total;
+  if (index > ACCEL_TABLE_SIZE) index = ACCEL_TABLE_SIZE;
+  return accel_table[index];
+}
+
+// ==================== 舵机控制 ====================
+
+int angleToPulse(int angle) {
+  return map(angle, 0, 180, SERVO_MIN_PULSE, SERVO_MAX_PULSE);
+}
+
+void sendServoPulse(int angle) {
+  digitalWrite(Z_SERVO_PIN, HIGH);
+  delayMicroseconds(angleToPulse(angle));
+  digitalWrite(Z_SERVO_PIN, LOW);
+}
+
+void setServoAngle(int angle) {
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  
+  zAxis.targetAngle = angle;
+  zAxis.moving = true;
+  zAxis.lastMoveTime = micros();
+  
+  for (int i = 0; i < SERVO_PULSE_COUNT; i++) {
+    sendServoPulse(angle);
+    delay(10);
+  }
+  
+  zAxis.currentAngle = angle;
+}
+
+void updateServo() {
+  uint32_t now = micros();
+  if (now - zAxis.lastPulseTime >= SERVO_PERIOD) {
+    sendServoPulse(zAxis.currentAngle);
+    zAxis.lastPulseTime = now;
+  }
+  
+  if (zAxis.moving) {
+    if (micros() - zAxis.lastMoveTime >= SERVO_SETTLE_TIME * 1000UL) {
+      zAxis.moving = false;
+      
+      if (waitingForZComplete) {
+        waitingForZComplete = false;
+        
+        if (zAxis.isUp) Serial.println("Z_UP_COMPLETE (10°)");
+        else Serial.println("Z_DOWN_COMPLETE (110°)");
+        
+        if (currentTask.active) executeNextCommand();
+      }
+    }
+  }
+}
+
+void zUp() {
+  setServoAngle(zAxis.upAngle);
+  zAxis.isUp = true;
+  Serial.println("Z_UP_START (10°)");
+  
+  if (currentTask.active) {
+    waitingForZComplete = true;
+    systemState = STATE_Z_MOVING;
+  }
+}
+
+void zDown() {
+  setServoAngle(zAxis.downAngle);
+  zAxis.isUp = false;
+  Serial.println("Z_DOWN_START (110°)");
+  
+  if (currentTask.active) {
+    waitingForZComplete = true;
+    systemState = STATE_Z_MOVING;
+  }
+}
+
+// ==================== 步进电机控制 ====================
+
+void setDirection(AxisState* axis, int8_t direction) {
+  if (direction > 0) {
+    digitalWrite(axis->dirPin, DIR_POSITIVE);
+    axis->currentDirection = 1;
+  } else {
+    digitalWrite(axis->dirPin, DIR_NEGATIVE);
+    axis->currentDirection = -1;
+  }
+}
+
+void enableAxis(AxisState* axis, bool enable) {
+  digitalWrite(axis->enablePin, enable ? HIGH : LOW);
+  axis->enabled = enable;
+}
+
+bool readLimit(AxisState* axis) {
+  return (digitalRead(axis->limitPin) == LOW);
+}
+
+void processPulses() {
+  uint32_t now = micros();
+  
+  if (!pulseState.active) {
+    if (pulseState.xPending || pulseState.yPending) {
+      if (pulseState.xPending) digitalWrite(X_STEP_PIN, HIGH);
+      if (pulseState.yPending) digitalWrite(Y_STEP_PIN, HIGH);
+      
+      pulseState.active = true;
+      pulseState.startTime = now;
+      
+      pulseState.xPending = false;
+      pulseState.yPending = false;
+    }
+  } 
+  else if (now - pulseState.startTime >= STEP_PULSE_WIDTH) {
+    if (pulseState.xStepDone) {
+      digitalWrite(X_STEP_PIN, LOW);
+      if (xAxis.currentDirection > 0) xAxis.currentPosition++;
+      else xAxis.currentPosition--;
+      pulseState.xStepDone = false;
+    }
+    if (pulseState.yStepDone) {
+      digitalWrite(Y_STEP_PIN, LOW);
+      if (yAxis.currentDirection > 0) yAxis.currentPosition++;
+      else yAxis.currentPosition--;
+      pulseState.yStepDone = false;
+    }
+    
+    pulseState.active = false;
+  }
+}
+
+void startMove(int32_t targetX, int32_t targetY, uint16_t speedHz) {
+  systemState = STATE_MOVING;
+  enableAxis(&xAxis, true);
+  enableAxis(&yAxis, true);
+  
+  int32_t dx = targetX - xAxis.currentPosition;
+  int32_t dy = targetY - yAxis.currentPosition;
+  
+  if (dx == 0 && dy == 0) {
+    Serial.println("MOVE_COMPLETE");
+    waitingForMoveComplete = true;
+    return;
+  }
+  
+  moveState.targetX = targetX;
+  moveState.targetY = targetY;
+  moveState.step_x = (dx > 0) ? 1 : -1;
+  moveState.step_y = (dy > 0) ? 1 : -1;
+  
+  setDirection(&xAxis, moveState.step_x);
+  setDirection(&yAxis, moveState.step_y);
+  
+  moveState.dx = (dx > 0) ? dx : -dx;
+  moveState.dy = (dy > 0) ? dy : -dy;
+  moveState.steps = (moveState.dx > moveState.dy) ? moveState.dx : moveState.dy;
+  moveState.err = 0;
+  
+  moveState.target_speed = speedHz;
+  if (moveState.target_speed < MIN_SPEED) moveState.target_speed = MIN_SPEED;
+  if (moveState.target_speed > MAX_SPEED) moveState.target_speed = MAX_SPEED;
+  
+  moveState.target_interval = 1000000U / moveState.target_speed;
+  if (moveState.target_interval < (STEP_PULSE_WIDTH * 2)) moveState.target_interval = STEP_PULSE_WIDTH * 2;
+  
+  moveState.start_interval = moveState.target_interval * START_SPEED_DIV;
+  if (moveState.start_interval > 10000) moveState.start_interval = 10000;
+  
+  uint32_t accel_steps = ACCEL_STEPS;
+  uint32_t half_steps = moveState.steps / 3;
+  moveState.accel_half = (accel_steps < half_steps) ? accel_steps : half_steps;
+  if (moveState.accel_half < 30) moveState.accel_half = 30;
+  
+  moveState.current_interval = moveState.start_interval;
+  moveState.accel_phase = 0;
+  moveState.move_phase = 0;
+  
+  moveState.step_count = 0;
+  moveState.active = true;
+  moveState.lastStepTime = micros();
+  moveState.nextStepTime = moveState.lastStepTime + moveState.current_interval;
+  
+  uint32_t mm_per_sec_x100 = ((uint32_t)moveState.target_speed * 100) / PULSE_PER_MM_INT;
+  uint32_t motor_rpm_x10 = ((uint32_t)moveState.target_speed * 60 * 10) / (MICROSTEPS * 200);
+  uint32_t distance_mm_x100 = ((uint32_t)moveState.steps * 100) / PULSE_PER_MM_INT;
+  
+  Serial.print("→ G01 速度: ");
+  Serial.print(moveState.target_speed);
+  Serial.print(" Hz, 间隔: ");
+  Serial.print(moveState.target_interval);
+  Serial.print(" us, 速度: ");
+  Serial.print(mm_per_sec_x100 / 100);
+  Serial.print(".");
+  Serial.print(mm_per_sec_x100 % 100);
+  Serial.print(" mm/s, 距离: ");
+  Serial.print(distance_mm_x100 / 100);
+  Serial.print(".");
+  Serial.print(distance_mm_x100 % 100);
+  Serial.print(" mm, 加速: ");
+  Serial.print(moveState.accel_half);
+  Serial.println(" 步");
+}
+
+void processMove() {
+  if (!moveState.active) return;
+  
+  uint32_t now = micros();
+  
+  processPulses();
+  
+  if (pulseState.active) return;
+  if (now < moveState.nextStepTime) return;
+  
+  bool stepX = false, stepY = false;
+  
+  if (moveState.dx >= moveState.dy) {
+    stepX = true;
+    moveState.err += moveState.dy;
+    if (moveState.err >= moveState.dx) {
+      stepY = true;
+      moveState.err -= moveState.dx;
+    }
+  } else {
+    stepY = true;
+    moveState.err += moveState.dx;
+    if (moveState.err >= moveState.dy) {
+      stepX = true;
+      moveState.err -= moveState.dy;
+    }
+  }
+  
+  if (stepX) {
+    pulseState.xPending = true;
+    pulseState.xStepDone = true;
+  }
+  if (stepY) {
+    pulseState.yPending = true;
+    pulseState.yStepDone = true;
+  }
+  
+  moveState.step_count++;
+  moveState.lastStepTime = now;
+  
+  if (moveState.steps > moveState.accel_half * 2) {
+    if (moveState.step_count < moveState.accel_half) {
+      moveState.move_phase = 0;
+      moveState.accel_phase = moveState.step_count;
+      uint16_t accel_val = getAccelValue(moveState.accel_phase, moveState.accel_half);
+      int32_t diff = (int32_t)moveState.target_interval - (int32_t)moveState.start_interval;
+      moveState.current_interval = moveState.start_interval + ((diff * (int32_t)accel_val) >> 10);
+    }
+    else if (moveState.step_count > moveState.steps - moveState.accel_half) {
+      moveState.move_phase = 2;
+      moveState.accel_phase = moveState.steps - moveState.step_count;
+      uint16_t accel_val = getAccelValue(moveState.accel_phase, moveState.accel_half);
+      int32_t diff = (int32_t)moveState.target_interval - (int32_t)moveState.start_interval;
+      moveState.current_interval = moveState.start_interval + ((diff * (int32_t)accel_val) >> 10);
+    }
+    else {
+      moveState.move_phase = 1;
+      moveState.current_interval = moveState.target_interval;
+    }
+  } else {
+    uint16_t half = moveState.steps / 2;
+    if (moveState.step_count < half) {
+      uint16_t accel_val = getAccelValue(moveState.step_count, half);
+      int32_t diff = (int32_t)moveState.target_interval - (int32_t)moveState.start_interval;
+      moveState.current_interval = moveState.start_interval + ((diff * (int32_t)accel_val) >> 10);
+    } else {
+      uint16_t decel_step = moveState.steps - moveState.step_count;
+      uint16_t accel_val = getAccelValue(decel_step, half);
+      int32_t diff = (int32_t)moveState.target_interval - (int32_t)moveState.start_interval;
+      moveState.current_interval = moveState.start_interval + ((diff * (int32_t)accel_val) >> 10);
+    }
+  }
+  
+  moveState.nextStepTime = now + moveState.current_interval;
+  
+  if (moveState.step_count >= moveState.steps) {
+    moveState.active = false;
+    enableAxis(&xAxis, false);
+    enableAxis(&yAxis, false);
+    
+    xAxis.currentPosition = moveState.targetX;
+    yAxis.currentPosition = moveState.targetY;
+    
+    Serial.println("MOVE_COMPLETE");
+    reportPosition();
+    waitingForMoveComplete = true;
+  }
+}
+
+// ==================== 归零 ====================
+
+void startHoming() {
+  Serial.println("HOMING_START");
+  zUp();
+  
+  systemState = STATE_HOMING;
+  
+  uint32_t homeInterval = 1000000U / HOME_SPEED;
+  
+  // X轴归零
+  Serial.println("HOMING_X");
+  enableAxis(&xAxis, true);
+  setDirection(&xAxis, -1);
+  
+  uint32_t startTime = micros();
+  uint32_t lastStep = 0;
+  
+  while (!readLimit(&xAxis) && (micros() - startTime < HOME_TIMEOUT * 1000UL)) {
+    uint32_t now = micros();
+    if (now - lastStep >= homeInterval) {
+      digitalWrite(X_STEP_PIN, HIGH);
+      delayMicroseconds(STEP_PULSE_WIDTH);
+      digitalWrite(X_STEP_PIN, LOW);
+      if (xAxis.currentDirection > 0) xAxis.currentPosition++;
+      else xAxis.currentPosition--;
+      lastStep = now;
+    }
+    updateServo();
+  }
+  
+  if (readLimit(&xAxis)) {
+    xAxis.currentPosition = 0;
+    xAxis.homed = true;
+    Serial.println("X_HOMED");
+    
+    setDirection(&xAxis, 1);
+    for (int i = 0; i < 50; i++) {
+      uint32_t stepTime = micros();
+      digitalWrite(X_STEP_PIN, HIGH);
+      delayMicroseconds(STEP_PULSE_WIDTH);
+      digitalWrite(X_STEP_PIN, LOW);
+      if (xAxis.currentDirection > 0) xAxis.currentPosition++;
+      else xAxis.currentPosition--;
+      while (micros() - stepTime < homeInterval);
+    }
+  }
+  enableAxis(&xAxis, false);
+  
+  uint32_t delayStart = micros();
+  while (micros() - delayStart < 500000);
+  
+  // Y轴归零
+  Serial.println("HOMING_Y");
+  enableAxis(&yAxis, true);
+  setDirection(&yAxis, -1);
+  
+  startTime = micros();
+  lastStep = 0;
+  
+  while (!readLimit(&yAxis) && (micros() - startTime < HOME_TIMEOUT * 1000UL)) {
+    uint32_t now = micros();
+    if (now - lastStep >= homeInterval) {
+      digitalWrite(Y_STEP_PIN, HIGH);
+      delayMicroseconds(STEP_PULSE_WIDTH);
+      digitalWrite(Y_STEP_PIN, LOW);
+      if (yAxis.currentDirection > 0) yAxis.currentPosition++;
+      else yAxis.currentPosition--;
+      lastStep = now;
+    }
+    updateServo();
+  }
+  
+  if (readLimit(&yAxis)) {
+    yAxis.currentPosition = 0;
+    yAxis.homed = true;
+    Serial.println("Y_HOMED");
+    
+    setDirection(&yAxis, 1);
+    for (int i = 0; i < 50; i++) {
+      uint32_t stepTime = micros();
+      digitalWrite(Y_STEP_PIN, HIGH);
+      delayMicroseconds(STEP_PULSE_WIDTH);
+      digitalWrite(Y_STEP_PIN, LOW);
+      if (yAxis.currentDirection > 0) yAxis.currentPosition++;
+      else yAxis.currentPosition--;
+      while (micros() - stepTime < homeInterval);
+    }
+  }
+  enableAxis(&yAxis, false);
+  
+  Serial.println("HOMING_COMPLETE");
+  reportPosition();
+  
+  if (currentTask.active) waitingForHomeComplete = true;
+  else {
+    systemState = STATE_IDLE;
+    Serial.println("READY");
+  }
+}
+
+// ==================== 任务解析 ====================
+
+bool parseTask(char* data) {
+  char* token = strtok(data, " ");
+  
+  if (token == NULL || strcmp(token, "TASK") != 0) return false;
+  
+  token = strtok(NULL, " ");
+  if (token == NULL) return false;
+  strcpy(currentTask.taskId, token);
+  
+  token = strtok(NULL, " ");
+  if (token == NULL) return false;
+  uint16_t cmdCount = atoi(token);
+  
+  if (cmdCount == 0 || cmdCount > MAX_TASK_SIZE) {
+    Serial.print("ERROR: Invalid command count: ");
+    Serial.println(cmdCount);
+    return false;
+  }
+  
+  if (ESP.getFreeHeap() < 2048) {
+    Serial.println("ERROR: Low memory");
+    return false;
+  }
+  
+  currentTask.commandCount = cmdCount;
+  
+  Serial.print("解析任务: ");
+  Serial.print(cmdCount);
+  Serial.println(" 条指令");
+  Serial.print("可用内存: ");
+  Serial.println(ESP.getFreeHeap());
+  
+  memset(currentTask.commands, 0, sizeof(currentTask.commands));
+  
+  for (uint16_t i = 0; i < cmdCount; i++) {
+    Command* cmd = &currentTask.commands[i];
+    
+    cmd->x = xAxis.currentPosition;
+    cmd->y = yAxis.currentPosition;
+    cmd->f = 15000;
+    cmd->dwell = 0;
+    cmd->type = CMD_G01;
+    
+    token = strtok(NULL, " ");
+    if (token == NULL) {
+      Serial.print("警告: 指令 ");
+      Serial.print(i);
+      Serial.println(" 解析提前结束");
+      currentTask.commandCount = i;
+      break;
+    }
+    
+    if (token[0] == 'G') {
+      int gNum = atoi(token + 1);
+      if (gNum == 0 || gNum == 1) {
+        cmd->type = CMD_G01;
+      }
+      else if (gNum == 4) cmd->type = CMD_G04;
+      else if (gNum == 28) cmd->type = CMD_G28;
+    } else if (token[0] == 'M') {
+      int mNum = atoi(token + 1);
+      if (mNum == 3) cmd->type = CMD_M03;
+      else if (mNum == 5) cmd->type = CMD_M05;
+    }
+    
+    if (cmd->type == CMD_G04) {
+      token = strtok(NULL, " ");
+      if (token != NULL && (token[0] == 'P' || token[0] == 'X')) {
+        cmd->dwell = atoi(token + 1);
+      }
+      continue;
+    }
+    
+    if (cmd->type == CMD_G28 || cmd->type == CMD_M03 || cmd->type == CMD_M05) {
+      continue;
+    }
+    
+    token = strtok(NULL, " ");
+    if (token != NULL && token[0] == 'X') {
+      float x_mm = atof(token + 1);
+      cmd->x = (int32_t)(x_mm * PULSE_PER_MM_INT);
+    }
+    
+    token = strtok(NULL, " ");
+    if (token != NULL && token[0] == 'Y') {
+      float y_mm = atof(token + 1);
+      cmd->y = (int32_t)(y_mm * PULSE_PER_MM_INT);
+    }
+    
+    token = strtok(NULL, " ");
+    if (token != NULL && token[0] == 'F') {
+      cmd->f = atoi(token + 1);
+      if (cmd->f > MAX_SPEED) cmd->f = MAX_SPEED;
+      
+      uint32_t mm_per_sec_x100 = ((uint32_t)cmd->f * 100) / PULSE_PER_MM_INT;
+      
+      Serial.print("  指令");
+      Serial.print(i);
+      Serial.print(": G01 F=");
+      Serial.print(cmd->f);
+      Serial.print(" Hz -> ");
+      Serial.print(mm_per_sec_x100 / 100);
+      Serial.print(".");
+      Serial.print(mm_per_sec_x100 % 100);
+      Serial.println(" mm/s");
+    }
+  }
+  
+  Serial.print("任务解析完成，共 ");
+  Serial.print(currentTask.commandCount);
+  Serial.println(" 条指令");
+  return true;
+}
+
+void startNewTask() {
+  currentTask.currentIndex = 0;
+  currentTask.active = true;
+  systemState = STATE_EXECUTING;
+  Serial.println("TASK_START");
+  executeNextCommand();
+}
+
+void executeNextCommand() {
+  if (!currentTask.active) return;
+  
+  if (currentTask.currentIndex >= currentTask.commandCount) {
+    zUp();
+    Serial.print("TASK_COMPLETE ");
+    Serial.println(currentTask.taskId);
+    currentTask.active = false;
+    systemState = STATE_IDLE;
+    Serial.println("READY");
+    return;
+  }
+  
+  Command* cmd = &currentTask.commands[currentTask.currentIndex];
+  currentTask.currentIndex++;
+  
+  Serial.print("[");
+  Serial.print(currentTask.currentIndex);
+  Serial.print("/");
+  Serial.print(currentTask.commandCount);
+  Serial.print("] ");
+  
+  switch(cmd->type) {
+    case CMD_G01: Serial.print("G01"); break;
+    case CMD_G04: Serial.print("G04"); break;
+    case CMD_G28: Serial.print("G28"); break;
+    case CMD_M03: Serial.print("M03"); break;
+    case CMD_M05: Serial.print("M05"); break;
+  }
+  
+  if (cmd->type == CMD_G01) {
+    uint32_t mm_per_sec_x100 = ((uint32_t)cmd->f * 100) / PULSE_PER_MM_INT;
+    float x_mm = (float)cmd->x / PULSE_PER_MM_INT;
+    float y_mm = (float)cmd->y / PULSE_PER_MM_INT;
+    Serial.print(" X="); Serial.print(x_mm, 2);
+    Serial.print(" Y="); Serial.print(y_mm, 2);
+    Serial.print(" F="); Serial.print(cmd->f);
+    Serial.print(" Hz (");
+    Serial.print(mm_per_sec_x100 / 100);
+    Serial.print(".");
+    Serial.print(mm_per_sec_x100 % 100);
+    Serial.print(" mm/s)");
+  }
+  Serial.println();
+  
+  switch(cmd->type) {
+    case CMD_G28:
+      startHoming();
+      break;
+      
+    case CMD_G04:
+      startDwell(cmd->dwell);
+      break;
+      
+    case CMD_M03:
+      zDown();
+      if (!waitingForZComplete) executeNextCommand();
+      break;
+      
+    case CMD_M05:
+      zUp();
+      if (!waitingForZComplete) executeNextCommand();
+      break;
+      
+    default:
+      startMove(cmd->x, cmd->y, cmd->f);
+      break;
+  }
+}
+
+void startDwell(uint16_t ms) {
+  if (ms > MAX_DELAY_TIME) ms = MAX_DELAY_TIME;
+  Serial.print("DWELL_START "); Serial.print(ms); Serial.println("ms");
+  dwellDuration = ms;
+  dwellStartTime = micros();
+  systemState = STATE_DWELL;
+  waitingForDwellComplete = true;
+}
+
+void resetSystem() {
+  systemState = STATE_IDLE;
+  currentTask.active = false;
+  currentTask.commandCount = 0;
+  currentTask.currentIndex = 0;
+  waitingForMoveComplete = false;
+  waitingForHomeComplete = false;
+  waitingForZComplete = false;
+  waitingForDwellComplete = false;
+  moveState.active = false;
+  enableAxis(&xAxis, false);
+  enableAxis(&yAxis, false);
+}
+
+void emergencyStop() {
+  moveState.active = false;
+  enableAxis(&xAxis, false);
+  enableAxis(&yAxis, false);
+  zUp();
+  resetSystem();
+  Serial.println("EMERGENCY_STOP");
+}
+
+// ==================== 状态报告 ====================
+
+void reportPosition() {
+  int32_t x_mm_x1000 = (xAxis.currentPosition * 1000) / PULSE_PER_MM_INT;
+  int32_t y_mm_x1000 = (yAxis.currentPosition * 1000) / PULSE_PER_MM_INT;
+  
+  Serial.print("POS X:");
+  Serial.print(xAxis.currentPosition);
+  Serial.print("("); 
+  Serial.print(x_mm_x1000 / 1000);
+  Serial.print(".");
+  int32_t x_frac = x_mm_x1000 % 1000;
+  if (x_frac < 10) Serial.print("00");
+  else if (x_frac < 100) Serial.print("0");
+  Serial.print(x_frac);
+  Serial.print("mm) Y:");
+  Serial.print(yAxis.currentPosition);
+  Serial.print("("); 
+  Serial.print(y_mm_x1000 / 1000);
+  Serial.print(".");
+  int32_t y_frac = y_mm_x1000 % 1000;
+  if (y_frac < 10) Serial.print("00");
+  else if (y_frac < 100) Serial.print("0");
+  Serial.print(y_frac);
+  Serial.print("mm) Z:");
+  Serial.print(zAxis.isUp ? "UP(10°)" : "DOWN(110°)");
+  Serial.print(" Angle:");
+  Serial.println(zAxis.currentAngle);
+}
+
+void reportStatus() {
+  Serial.print("STATE:");
+  switch(systemState) {
+    case STATE_IDLE: Serial.print("IDLE"); break;
+    case STATE_HOMING: Serial.print("HOMING"); break;
+    case STATE_MOVING: Serial.print("MOVING"); break;
+    case STATE_EXECUTING: Serial.print("EXECUTING"); break;
+    case STATE_Z_MOVING: Serial.print("Z_MOVING"); break;
+    case STATE_DWELL: Serial.print("DWELL"); break;
+  }
+  
+  if (currentTask.active) {
+    Serial.print(" TASK:");
+    Serial.print(currentTask.taskId);
+    Serial.print(" ");
+    Serial.print(currentTask.currentIndex);
+    Serial.print("/");
+    Serial.print(currentTask.commandCount);
+  }
+  
+  Serial.print(" Z:");
+  Serial.print(zAxis.isUp ? "UP(10°)" : "DOWN(110°)");
+  Serial.print(" Angle:");
+  Serial.println(zAxis.currentAngle);
+}
+
+// ==================== 命令处理 ====================
+
+void processCommand(char* cmd) {
+  Serial.print("> "); Serial.println(cmd);
+  
+  if (strncmp(cmd, "TASK", 4) == 0) {
+    if (systemState != STATE_IDLE) {
+      Serial.print("ERROR:BUSY ");
+      switch(systemState) {
+        case STATE_HOMING: Serial.println("HOMING"); break;
+        case STATE_MOVING: Serial.println("MOVING"); break;
+        case STATE_EXECUTING: Serial.println("EXECUTING"); break;
+        case STATE_Z_MOVING: Serial.println("Z_MOVING"); break;
+        case STATE_DWELL: Serial.println("DWELL"); break;
+        default: Serial.println("UNKNOWN");
+      }
+      return;
+    }
+    
+    if (parseTask(cmd)) {
+      Serial.println("TASK_ACCEPTED");
+      startNewTask();
+    } else {
+      Serial.println("ERROR:TASK_FORMAT");
+    }
+  }
+  else if (strcmp(cmd, "POS") == 0) {
+    reportPosition();
+    Serial.println("READY");
+  }
+  else if (strcmp(cmd, "STATUS") == 0) {
+    reportStatus();
+    Serial.println("READY");
+  }
+  else if (cmd[0] == '!') {
+    emergencyStop();
+    Serial.println("READY");
+  }
+  else if (strcmp(cmd, "HOME") == 0) {
+    if (systemState != STATE_IDLE) {
+      Serial.print("ERROR:BUSY ");
+      Serial.println("NOT_IDLE");
+      return;
+    }
+    startHoming();
+  }
+  else if (strcmp(cmd, "ZUP") == 0) {
+    zUp();
+    Serial.println("READY");
+  }
+  else if (strcmp(cmd, "ZDOWN") == 0) {
+    zDown();
+    Serial.println("READY");
+  }
+  else if (strcmp(cmd, "RESET") == 0) {
+    resetSystem();
+    Serial.println("RESET_COMPLETE");
+    Serial.println("READY");
+  }
+  else {
+    Serial.println("ERROR:UNKNOWN");
+  }
+}
+
+// ==================== 测试函数 ====================
+
+void testPulse() {
+  Serial.println("测试脉冲 (20us)...");
+  
+  enableAxis(&xAxis, true);
+  enableAxis(&yAxis, true);
+  
+  setDirection(&xAxis, 1);
+  setDirection(&yAxis, 1);
+  
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(X_STEP_PIN, HIGH);
+    digitalWrite(Y_STEP_PIN, HIGH);
+    delayMicroseconds(STEP_PULSE_WIDTH);
+    digitalWrite(X_STEP_PIN, LOW);
+    digitalWrite(Y_STEP_PIN, LOW);
+    
+    if (xAxis.currentDirection > 0) xAxis.currentPosition++;
+    else xAxis.currentPosition--;
+    if (yAxis.currentDirection > 0) yAxis.currentPosition++;
+    else yAxis.currentPosition--;
+    
+    delay(500);
+  }
+  
+  enableAxis(&xAxis, false);
+  enableAxis(&yAxis, false);
+  
+  Serial.println("测试完成");
+}
+
+// ==================== 初始化 ====================
+
+void setup() {
+  // 必须先设置缓冲区大小，再开始串口
+  Serial.setRxBufferSize(SERIAL_RX_BUFFER_SIZE);
+  Serial.setTxBufferSize(SERIAL_TX_BUFFER_SIZE);
+  
+  Serial.begin(SERIAL_BAUD);
+  
+  initAccelTable();
+  
+  Serial.println("\n\n============================================");
+  Serial.println("双轴写字机器人 - ESP32-S3稳定版");
+  Serial.println("============================================");
+  Serial.print("电机细分: ");
+  Serial.print(MICROSTEPS);
+  Serial.println(" 细分");
+  Serial.print("电子齿轮: ");
+  Serial.print(PULSE_PER_MM_INT);
+  Serial.println(" 脉冲/mm");
+  Serial.print("脉冲宽度: ");
+  Serial.print(STEP_PULSE_WIDTH);
+  Serial.println(" us");
+  Serial.print("串口缓冲区: ");
+  Serial.print(SERIAL_RX_BUFFER_SIZE);
+  Serial.println(" 字节");
+  Serial.print("最大指令数/任务: ");
+  Serial.print(MAX_TASK_SIZE);
+  Serial.println(" 条");
+  Serial.print("Z轴角度: 抬起 ");
+  Serial.print(Z_UP_ANGLE);
+  Serial.print("°, 放下 ");
+  Serial.print(Z_DOWN_ANGLE);
+  Serial.println("°");
+  Serial.println("============================================");
+  
+  pinMode(X_STEP_PIN, OUTPUT);
+  pinMode(X_DIR_PIN, OUTPUT);
+  pinMode(X_ENABLE_PIN, OUTPUT);
+  pinMode(X_LIMIT_MIN, INPUT_PULLUP);
+  
+  pinMode(Y_STEP_PIN, OUTPUT);
+  pinMode(Y_DIR_PIN, OUTPUT);
+  pinMode(Y_ENABLE_PIN, OUTPUT);
+  pinMode(Y_LIMIT_MIN, INPUT_PULLUP);
+  
+  pinMode(Z_SERVO_PIN, OUTPUT);
+  digitalWrite(Z_SERVO_PIN, LOW);
+  
+  enableAxis(&xAxis, false);
+  enableAxis(&yAxis, false);
+  
+  pulseState.active = false;
+  pulseState.xPending = false;
+  pulseState.yPending = false;
+  pulseState.xStepDone = false;
+  pulseState.yStepDone = false;
+  
+  delay(500);
+  setServoAngle(Z_UP_ANGLE);
+  zAxis.isUp = true;
+  delay(SERVO_SETTLE_TIME);
+  
+  Serial.println("系统就绪");
+  Serial.println("输入 'TEST' 测试脉冲");
+  Serial.println("READY");
+}
+
+// ==================== 主循环 ====================
+
+void loop() {
+  updateServo();
+  processMove();
+  
+  if (waitingForDwellComplete) {
+    if (micros() - dwellStartTime >= (uint32_t)dwellDuration * 1000UL) {
+      waitingForDwellComplete = false;
+      Serial.println("DWELL_COMPLETE");
+      if (currentTask.active) {
+        systemState = STATE_EXECUTING;
+        executeNextCommand();
+      }
+    }
+  }
+  
+  if (waitingForMoveComplete) {
+    waitingForMoveComplete = false;
+    if (currentTask.active) executeNextCommand();
+  }
+  
+  if (waitingForHomeComplete) {
+    waitingForHomeComplete = false;
+    if (currentTask.active) executeNextCommand();
+    else {
+      systemState = STATE_IDLE;
+      Serial.println("READY");
+    }
+  }
+  
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      inputBuffer[bufferIndex] = '\0';
+      
+      if (strcmp(inputBuffer, "TEST") == 0) {
+        testPulse();
+        bufferIndex = 0;
+        break;
+      }
+      
+      if (systemState == STATE_IDLE || systemState == STATE_EXECUTING) {
+        char cmd[1024];
+        strcpy(cmd, inputBuffer);
+        bufferIndex = 0;
+        processCommand(cmd);
+      } else {
+        stringComplete = true;
+      }
+      break;
+    } else if (c != '\r' && bufferIndex < sizeof(inputBuffer) - 1) {
+      inputBuffer[bufferIndex++] = c;
+    }
+  }
+  
+  if (stringComplete && systemState == STATE_IDLE) {
+    char cmd[1024];
+    strcpy(cmd, inputBuffer);
+    bufferIndex = 0;
+    stringComplete = false;
+    processCommand(cmd);
+  }
+}
