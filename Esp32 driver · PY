@@ -1,27 +1,63 @@
 """
-UGIR L0 反射层 · ESP32 双轴写字机器人驱动
+UGIR L0 Reflex Layer - ESP32 Driver
 reflex/esp32_driver.py
 
-设计原则：
-  - 所有动作（包括Z轴）全部通过 TASK 协议发送
-  - 不使用 ZUP / ZDOWN / HOME 单独指令
-  - L0层对上层完全隐藏串口细节
-  - 每个公开方法都是一个「原子反射动作」
+Robustness design:
+  - All actions go through TASK protocol (including Z axis)
+  - Auto-retry on timeout (configurable attempts)
+  - Auto-reconnect on serial disconnection
+  - Never crashes the caller - all errors returned as Result objects
+  - Emergency stop is the only method that bypasses TASK protocol
 """
 
 import serial
+import serial.tools.list_ports
 import threading
 import time
 import queue
 import logging
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Callable
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════
-#  数据结构
+#  Result type - never throw at the caller
+# ══════════════════════════════════════════
+
+class Status(Enum):
+    OK       = "ok"
+    TIMEOUT  = "timeout"       # waited too long for READY
+    RETRY    = "retry"         # succeeded after retries
+    ESP_ERR  = "esp_error"     # ESP32 replied ERROR:...
+    SERIAL   = "serial_error"  # serial port problem
+    ESTOP    = "estop"         # emergency stop triggered
+
+
+@dataclass
+class Result:
+    status: Status
+    message: str = ""
+    attempts: int = 1
+
+    @property
+    def ok(self) -> bool:
+        return self.status in (Status.OK, Status.RETRY)
+
+    def __str__(self):
+        if self.ok:
+            s = "OK"
+            if self.attempts > 1:
+                s += f" (after {self.attempts} attempts)"
+        else:
+            s = f"FAIL [{self.status.value}] {self.message}"
+        return s
+
+
+# ══════════════════════════════════════════
+#  Data structures
 # ══════════════════════════════════════════
 
 @dataclass
@@ -37,12 +73,11 @@ class Position:
 
 @dataclass
 class TaskCommand:
-    """单条TASK指令"""
-    type: str          # 'G01' | 'M03' | 'M05' | 'G28' | 'G04'
-    x: float = 0.0    # mm（G01用）
-    y: float = 0.0    # mm（G01用）
-    f: int = 15000    # Hz（G01用）
-    p: int = 0        # ms（G04用）
+    type: str        # 'G01' | 'M03' | 'M05' | 'G28' | 'G04'
+    x: float = 0.0
+    y: float = 0.0
+    f: int = 15000
+    p: int = 0
 
     def to_str(self) -> str:
         if self.type == 'G01':
@@ -50,158 +85,199 @@ class TaskCommand:
         elif self.type == 'G04':
             return f"G04 P{self.p}"
         else:
-            return self.type  # M03 / M05 / G28
+            return self.type
 
 
 # ══════════════════════════════════════════
-#  ESP32 驱动
+#  ESP32 Driver
 # ══════════════════════════════════════════
 
 class ESP32Driver:
     """
-    UGIR L0 反射层 · ESP32驱动
+    UGIR L0 Reflex Layer - ESP32 two-axis drawing robot driver.
 
-    所有动作通过 TASK 协议发送。
-    上层只调用行为原子方法，不接触串口协议。
+    All motion commands go through the TASK protocol.
+    All public methods return a Result - they never raise exceptions.
 
-    用法：
+    Usage:
         driver = ESP32Driver('COM9')
-        driver.connect()
-        driver.home()
-        driver.draw_stroke([(0, 0), (0, 30), (15, 30)])
+        r = driver.connect()
+        if not r.ok:
+            print(f"Connection failed: {r}")
+            return
+
+        r = driver.home()
+        r = driver.draw_stroke([(0,0),(0,30),(15,30)])
         driver.disconnect()
 
-        # 或使用 with 语法：
+        # or with context manager (connect/disconnect auto):
         with ESP32Driver('COM9') as robot:
             robot.home()
             robot.draw_stroke([(0,0),(0,30)])
     """
 
-    # ESP32 回复的关键信号
-    _READY_SIGNALS = {'READY', 'RESET_COMPLETE'}
+    _READY_SIGNALS  = {'READY', 'RESET_COMPLETE'}
+    _MAX_CMDS_PER_TASK = 90     # ESP32 limit is 96, keep 6 as margin
 
-    # 每个TASK最多指令数（ESP32固件限制96，留6条余量）
-    _MAX_CMDS_PER_TASK = 90
+    DEFAULT_MOVE_SPEED   = 15000
+    DEFAULT_TRAVEL_SPEED = 25000
 
-    # 默认速度（Hz）
-    DEFAULT_MOVE_SPEED   = 15000   # 书写速度 ≈ 18.75 mm/s
-    DEFAULT_TRAVEL_SPEED = 25000   # 空走速度（笔抬起时）
-
-    def __init__(self, port: str = 'COM9', baud: int = 115200):
-        self.port = port
-        self.baud = baud
+    def __init__(self,
+                 port: str = 'COM9',
+                 baud: int = 115200,
+                 max_retries: int = 3,
+                 retry_delay: float = 1.5,
+                 reconnect_attempts: Optional[int] = None,
+                 reconnect_delay: float = 3.0,
+                 on_reconnect: Optional[Callable] = None):
+        """
+        Args:
+            port:                Serial port, e.g. 'COM9' or '/dev/ttyUSB0'
+            baud:                Baud rate (must match ESP32 firmware: 115200)
+            max_retries:         How many times to retry a timed-out command
+            retry_delay:         Seconds to wait between retries
+            reconnect_attempts:  Max reconnect attempts after serial loss.
+                                 None (default) = retry forever (unattended mode)
+            reconnect_delay:     Seconds between reconnect attempts
+            on_reconnect:        Optional callback fired after a successful reconnect
+        """
+        self.port               = port
+        self.baud               = baud
+        self.max_retries        = max_retries
+        self.retry_delay        = retry_delay
+        self.reconnect_attempts = reconnect_attempts  # None = infinite
+        self.reconnect_delay    = reconnect_delay
+        self.on_reconnect       = on_reconnect
 
         self._ser: Optional[serial.Serial] = None
-        self._rx_queue: queue.Queue = queue.Queue()
+        self._rx_queue: queue.Queue        = queue.Queue()
         self._reader_thread: Optional[threading.Thread] = None
-        self._running = False
+        self._running     = False
+        self._estop_flag  = False
 
-        self.position = Position()
+        self.position     = Position()
         self._task_counter = 0
+        self._connected   = False
 
     # ──────────────────────────────────────
-    #  连接管理
+    #  Connection management
     # ──────────────────────────────────────
 
-    def connect(self, wait_timeout: float = 15.0) -> 'ESP32Driver':
-        """连接串口，等待ESP32启动完成"""
-        logger.info(f"连接 {self.port} @ {self.baud} baud...")
-        self._ser = serial.Serial(self.port, self.baud, timeout=1)
-        self._running = True
-        self._reader_thread = threading.Thread(
-            target=self._read_loop, daemon=True, name='esp32-reader'
-        )
-        self._reader_thread.start()
+    def connect(self, wait_timeout: float = 15.0) -> Result:
+        """Open serial port and wait for ESP32 startup READY."""
+        try:
+            logger.info(f"Connecting to {self.port} @ {self.baud}...")
+            self._ser = serial.Serial(self.port, self.baud, timeout=1)
+            self._running    = True
+            self._estop_flag = False
+            self._connected  = True
 
-        # 等待启动完成（ESP32上电后会打印READY）
-        self._wait_ready(wait_timeout)
-        logger.info("ESP32 已就绪")
-        return self
+            self._reader_thread = threading.Thread(
+                target=self._read_loop, daemon=True, name='esp32-reader')
+            self._reader_thread.start()
+
+            r = self._wait_ready(wait_timeout)
+            if r.ok:
+                logger.info("ESP32 ready.")
+            return r
+
+        except serial.SerialException as e:
+            msg = f"Cannot open {self.port}: {e}"
+            logger.error(msg)
+            self._connected = False
+            return Result(Status.SERIAL, msg)
 
     def disconnect(self):
-        """断开连接"""
-        self._running = False
+        """Close serial connection cleanly."""
+        self._running    = False
+        self._connected  = False
         if self._ser and self._ser.is_open:
             self._ser.close()
-        logger.info("已断开")
+        logger.info("Disconnected.")
 
-    def __enter__(self):
-        return self.connect()
+    def __enter__(self) -> 'ESP32Driver':
+        r = self.connect()
+        if not r.ok:
+            raise RuntimeError(f"ESP32 connect failed: {r}")
+        return self
 
     def __exit__(self, *_):
         self.disconnect()
 
+    def is_connected(self) -> bool:
+        return self._connected and self._ser is not None and self._ser.is_open
+
     # ──────────────────────────────────────
-    #  行为原子（L0 反射动作）
-    #  全部通过 TASK 协议发送
+    #  Public action atoms
+    #  All return Result, never raise.
     # ──────────────────────────────────────
 
-    def home(self):
+    def home(self) -> Result:
         """
-        归零：X/Y轴回到原点，笔抬起。
-        对应TASK内的 G28 指令。
+        Homing: raise pen, move X/Y to origin switches.
+        Typically takes 10-60s depending on start position.
         """
-        logger.info("执行归零...")
+        logger.info("Homing...")
         cmds = [
-            TaskCommand('M05'),   # 先抬笔，防止划到纸
-            TaskCommand('G28'),   # 归零
+            TaskCommand('M05'),
+            TaskCommand('G28'),
         ]
-        self._send_task(cmds, task_id='home', timeout=90.0)
-        logger.info(f"归零完成，当前位置：{self.position}")
+        r = self._send_task(cmds, task_id='home', timeout=90.0)
+        if r.ok:
+            logger.info(f"Home complete. Position: {self.position}")
+        return r
 
     def move_to(self, x_mm: float, y_mm: float,
-                speed: int = None) -> None:
-        """
-        空走移动（确保笔抬起）到指定坐标。
-        """
+                speed: int = None) -> Result:
+        """Travel move (pen raised) to absolute position."""
         speed = speed or self.DEFAULT_TRAVEL_SPEED
         cmds = [
             TaskCommand('M05'),
             TaskCommand('G01', x=x_mm, y=y_mm, f=speed),
         ]
-        self._send_task(cmds, task_id='move')
+        return self._send_task(cmds, task_id='move')
 
     def draw_stroke(self,
                     points: List[Tuple[float, float]],
-                    speed: int = None) -> None:
+                    speed: int = None) -> Result:
         """
-        核心行为原子：画一条完整笔画。
+        Core action atom: draw one complete stroke.
 
-        自动处理全部Z轴控制：
-          抬笔 → 空走到起点 → 落笔 → 依次连线 → 抬笔
+        Automatically handles all Z-axis control:
+          raise pen -> travel to start -> lower pen -> draw path -> raise pen
 
         Args:
-            points: [(x_mm, y_mm), ...]  至少需要2个点
-            speed:  书写速度 Hz，默认 15000 (≈18.75 mm/s)
+            points: [(x_mm, y_mm), ...]  minimum 2 points
+            speed:  drawing speed in Hz (default 15000 = ~18.75 mm/s)
         """
         if len(points) < 2:
-            raise ValueError("draw_stroke 需要至少2个点")
+            return Result(Status.ESP_ERR, "draw_stroke needs at least 2 points")
 
         speed = speed or self.DEFAULT_MOVE_SPEED
         cmds = [
             TaskCommand('M05'),
             TaskCommand('G01', x=points[0][0], y=points[0][1],
-                        f=self.DEFAULT_TRAVEL_SPEED),   # 空走到起点
-            TaskCommand('M03'),                          # 落笔
+                        f=self.DEFAULT_TRAVEL_SPEED),
+            TaskCommand('M03'),
         ]
         for pt in points[1:]:
             cmds.append(TaskCommand('G01', x=pt[0], y=pt[1], f=speed))
-        cmds.append(TaskCommand('M05'))                  # 抬笔
+        cmds.append(TaskCommand('M05'))
 
-        self._send_task(cmds, task_id='stroke')
+        return self._send_task(cmds, task_id='stroke')
 
     def draw_strokes(self,
                      strokes: List[List[Tuple[float, float]]],
-                     speed: int = None) -> None:
+                     speed: int = None) -> Result:
         """
-        画多条笔画（自动合并为尽可能少的TASK批次）。
+        Draw multiple strokes, auto-batched into minimum number of TASKs.
 
         Args:
             strokes: [[(x,y),...], [(x,y),...], ...]
-            speed:   书写速度 Hz
+            speed:   drawing speed in Hz
         """
         speed = speed or self.DEFAULT_MOVE_SPEED
-        all_cmds = []
+        all_cmds: List[TaskCommand] = []
 
         for stroke in strokes:
             if len(stroke) < 2:
@@ -215,89 +291,225 @@ class ESP32Driver:
                 all_cmds.append(TaskCommand('G01', x=pt[0], y=pt[1], f=speed))
             all_cmds.append(TaskCommand('M05'))
 
-        self._send_task(all_cmds, task_id='strokes')
+        if not all_cmds:
+            return Result(Status.ESP_ERR, "No valid strokes")
 
-    def pen_park(self) -> None:
-        """
-        停靠：笔抬起，回到原点附近安全位置。
-        建议每次任务结束后调用。
-        """
+        return self._send_task(all_cmds, task_id='strokes')
+
+    def pen_park(self) -> Result:
+        """Raise pen and move to safe home corner. Call after every job."""
         cmds = [
             TaskCommand('M05'),
             TaskCommand('G01', x=2.0, y=2.0, f=self.DEFAULT_TRAVEL_SPEED),
         ]
-        self._send_task(cmds, task_id='park')
+        return self._send_task(cmds, task_id='park')
 
-    def emergency_stop(self):
+    def get_position(self) -> Position:
+        """Query current position. Returns last known if serial unavailable."""
+        if self.is_connected():
+            self._send_raw('POS')
+            time.sleep(0.25)
+        return self.position
+
+    def emergency_stop(self) -> Result:
         """
-        紧急停止。
-        注意：这是唯一不走TASK协议的方法，因为紧急情况需要立即响应。
+        Immediate stop. The ONLY method that bypasses TASK protocol.
+        Sets internal estop flag - call reset() to resume normal operation.
         """
-        logger.warning("紧急停止！")
-        self._send_raw('!')
-        time.sleep(0.1)
-        # 清空接收队列
+        logger.warning("EMERGENCY STOP")
+        self._estop_flag = True
+        if self.is_connected():
+            try:
+                self._send_raw('!')
+            except Exception:
+                pass
+        # Drain queue
         while not self._rx_queue.empty():
             try:
                 self._rx_queue.get_nowait()
             except queue.Empty:
                 break
+        return Result(Status.ESTOP, "Emergency stop issued")
 
-    def get_position(self) -> Position:
-        """查询当前位置（POS指令，立即返回）"""
-        self._send_raw('POS')
-        time.sleep(0.2)   # 等串口回复被_read_loop解析
-        return self.position
+    def reset(self) -> Result:
+        """Clear estop flag and reset ESP32 state machine."""
+        self._estop_flag = False
+        if not self.is_connected():
+            return Result(Status.SERIAL, "Not connected")
+        self._send_raw('RESET')
+        return self._wait_ready(10.0)
 
     # ──────────────────────────────────────
-    #  TASK 发送引擎（内部）
+    #  TASK send engine (internal)
     # ──────────────────────────────────────
 
-    def _send_task(self, cmds: List[TaskCommand],
+    def _send_task(self,
+                   cmds: List[TaskCommand],
                    task_id: str = 'task',
-                   timeout: float = 120.0):
+                   timeout: float = 120.0) -> Result:
         """
-        将指令列表自动分块，逐批发送为TASK，
-        每批等待READY后再发下一批。
+        Split commands into chunks, send each as a TASK, wait for READY.
+        Retries each chunk up to max_retries times on timeout.
+        Attempts serial reconnect if port is lost.
         """
         if not cmds:
-            return
+            return Result(Status.OK, "nothing to do")
+
+        if self._estop_flag:
+            return Result(Status.ESTOP, "estop active - call reset() first")
+
+        if not self.is_connected():
+            r = self._try_reconnect()
+            if not r.ok:
+                return r
 
         self._task_counter += 1
         base_id = f"{task_id}_{self._task_counter}"
-
-        # 按 _MAX_CMDS_PER_TASK 分块
-        chunks = [
-            cmds[i:i + self._MAX_CMDS_PER_TASK]
-            for i in range(0, len(cmds), self._MAX_CMDS_PER_TASK)
-        ]
+        chunks   = [cmds[i:i + self._MAX_CMDS_PER_TASK]
+                    for i in range(0, len(cmds), self._MAX_CMDS_PER_TASK)]
+        total    = len(chunks)
 
         for ci, chunk in enumerate(chunks):
-            tid = f"{base_id}_p{ci}" if len(chunks) > 1 else base_id
-
-            # 拼装协议字符串
+            tid   = f"{base_id}_p{ci}" if total > 1 else base_id
             parts = [f"TASK {tid} {len(chunk)}"]
             for cmd in chunk:
                 parts.append(cmd.to_str())
             raw = ' '.join(parts)
 
-            logger.debug(f"→ [{len(chunk)}条] {tid}")
-            self._send_raw(raw)
-            self._wait_ready(timeout)
+            r = self._send_with_retry(raw, timeout=timeout,
+                                       label=f"[{ci+1}/{total}] {tid}")
+            if not r.ok:
+                logger.error(f"Chunk {ci+1}/{total} failed: {r}")
+                return r
+
+        return Result(Status.OK if total == 1 else Status.RETRY,
+                      attempts=total)
+
+    def _send_with_retry(self, raw: str, timeout: float,
+                          label: str = '') -> Result:
+        """
+        Send a raw TASK string and wait for READY.
+        Retries on timeout; attempts reconnect on serial error.
+        """
+        last_result = Result(Status.TIMEOUT)
+
+        for attempt in range(1, self.max_retries + 1):
+            if self._estop_flag:
+                return Result(Status.ESTOP, "estop during retry")
+
+            # Reconnect if needed
+            if not self.is_connected():
+                rc = self._try_reconnect()
+                if not rc.ok:
+                    return rc
+
+            try:
+                logger.debug(f"Send attempt {attempt}/{self.max_retries}: "
+                             f"{label} ({len(raw)} bytes)")
+                self._send_raw(raw)
+                r = self._wait_ready(timeout)
+
+                if r.ok:
+                    if attempt > 1:
+                        r.status   = Status.RETRY
+                        r.attempts = attempt
+                        logger.info(f"Succeeded on attempt {attempt}: {label}")
+                    return r
+
+                # ESP32 returned an error - don't retry, it's a protocol issue
+                if r.status == Status.ESP_ERR:
+                    return r
+
+                # Timeout - will retry
+                last_result = r
+                logger.warning(f"Timeout on attempt {attempt}/{self.max_retries}"
+                               f" for {label}. Retrying in {self.retry_delay}s...")
+                time.sleep(self.retry_delay)
+
+            except serial.SerialException as e:
+                logger.error(f"Serial error on attempt {attempt}: {e}")
+                self._connected = False
+                last_result = Result(Status.SERIAL, str(e))
+                time.sleep(self.retry_delay)
+
+        logger.error(f"All {self.max_retries} attempts failed for {label}")
+        return last_result
 
     # ──────────────────────────────────────
-    #  串口底层（内部）
+    #  Reconnect logic (internal)
+    # ──────────────────────────────────────
+
+    def _try_reconnect(self) -> Result:
+        """
+        Try to reopen the serial port.
+        If reconnect_attempts is None, retries forever (unattended mode).
+        Fires on_reconnect callback on success.
+        """
+        infinite = self.reconnect_attempts is None
+        limit    = self.reconnect_attempts or 0
+        label    = "infinite" if infinite else str(limit)
+        logger.warning(f"Serial lost. Reconnecting to {self.port} "
+                       f"(max attempts: {label})...")
+
+        attempt = 0
+        while infinite or attempt < limit:
+            attempt += 1
+            logger.info(f"Reconnect attempt {attempt}/{label}...")
+
+            try:
+                if self._ser:
+                    try:
+                        self._ser.close()
+                    except Exception:
+                        pass
+
+                time.sleep(self.reconnect_delay)
+                self._ser = serial.Serial(self.port, self.baud, timeout=1)
+                self._connected = True
+
+                # Restart reader thread if it died
+                if (self._reader_thread is None
+                        or not self._reader_thread.is_alive()):
+                    self._running = True
+                    self._reader_thread = threading.Thread(
+                        target=self._read_loop, daemon=True,
+                        name='esp32-reader')
+                    self._reader_thread.start()
+
+                r = self._wait_ready(10.0)
+                if r.ok:
+                    logger.info(f"Reconnected after {attempt} attempt(s).")
+                    if self.on_reconnect:
+                        try:
+                            self.on_reconnect()
+                        except Exception as e:
+                            logger.warning(f"on_reconnect callback error: {e}")
+                    return Result(Status.RETRY,
+                                  f"Reconnected after {attempt} attempts",
+                                  attempts=attempt)
+
+            except serial.SerialException as e:
+                logger.warning(f"Attempt {attempt} failed: {e}")
+
+        # Only reachable when reconnect_attempts is a finite number
+        msg = f"Could not reconnect to {self.port} after {limit} attempts"
+        logger.error(msg)
+        self._connected = False
+        return Result(Status.SERIAL, msg)
+
+
+    # ──────────────────────────────────────
+    #  Serial low-level (internal)
     # ──────────────────────────────────────
 
     def _send_raw(self, cmd: str):
-        """直接发送原始字符串（加换行符）"""
         if not self._ser or not self._ser.is_open:
-            raise RuntimeError("串口未连接")
+            raise serial.SerialException("Port not open")
         self._ser.write((cmd + '\n').encode('utf-8'))
-        logger.debug(f"→ RAW: {cmd[:80]}{'...' if len(cmd)>80 else ''}")
+        logger.debug(f"→ {cmd[:100]}{'...' if len(cmd) > 100 else ''}")
 
     def _read_loop(self):
-        """后台线程：持续读取串口，解析关键信号并推入队列"""
+        """Background thread: read serial lines, parse, push to queue."""
         while self._running:
             try:
                 raw = self._ser.readline()
@@ -309,7 +521,6 @@ class ESP32Driver:
 
                 logger.debug(f"← {line}")
 
-                # 自动解析位置信息
                 if line.startswith('POS '):
                     self._parse_position(line)
 
@@ -317,94 +528,125 @@ class ESP32Driver:
 
             except serial.SerialException as e:
                 if self._running:
-                    logger.error(f"串口异常: {e}")
+                    logger.error(f"Reader thread serial error: {e}")
+                    self._connected = False
                 break
             except Exception as e:
-                logger.warning(f"读取异常: {e}")
+                logger.warning(f"Reader thread error: {e}")
 
-    def _wait_ready(self, timeout: float = 30.0):
+    def _wait_ready(self, timeout: float) -> Result:
         """
-        阻塞等待 READY 信号。
-        遇到 ERROR 或 EMERGENCY_STOP 立即抛出异常。
+        Block until READY signal or timeout.
+        Returns Result - never raises.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 line = self._rx_queue.get(timeout=0.5)
+
                 if line in self._READY_SIGNALS:
-                    return
+                    return Result(Status.OK)
+
                 if line.startswith('ERROR'):
-                    raise RuntimeError(f"ESP32 报错: {line}")
+                    logger.warning(f"ESP32 error: {line}")
+                    return Result(Status.ESP_ERR, line)
+
                 if 'EMERGENCY_STOP' in line:
-                    raise RuntimeError("紧急停止触发")
+                    self._estop_flag = True
+                    return Result(Status.ESTOP, "ESP32 triggered emergency stop")
+
             except queue.Empty:
                 continue
-        raise TimeoutError(f"等待 READY 超时（{timeout}s）")
+
+        return Result(Status.TIMEOUT,
+                      f"No READY within {timeout:.0f}s")
 
     def _parse_position(self, line: str):
         """
-        解析 POS 回复，更新 self.position
-        ESP32格式：POS X:800(1.000mm) Y:1600(2.000mm) Z:UP(0°) Angle:0
+        Parse POS reply and update self.position.
+        ESP32 format: POS X:800(1.000mm) Y:1600(2.000mm) Z:UP(0°) Angle:0
         """
         try:
             xi = line.index('(', line.index('X:')) + 1
             xj = line.index('mm)', xi)
-            x = float(line[xi:xj])
+            x  = float(line[xi:xj])
 
             yi = line.index('(', line.index('Y:')) + 1
             yj = line.index('mm)', yi)
-            y = float(line[yi:yj])
+            y  = float(line[yi:yj])
 
-            z_up = 'Z:UP' in line
-
-            self.position = Position(x_mm=x, y_mm=y, z_up=z_up)
+            self.position = Position(x_mm=x, y_mm=y, z_up='Z:UP' in line)
         except Exception:
-            pass  # 解析失败不影响主流程
+            pass
 
 
 # ══════════════════════════════════════════
-#  快速测试入口
+#  Quick test entry point
 #  python esp32_driver.py
 # ══════════════════════════════════════════
 
 if __name__ == '__main__':
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s'
     )
 
-    print("=" * 50)
-    print("UGIR L0 · ESP32 驱动测试")
-    print("=" * 50)
+    def on_reconnect():
+        print("  [!] Reconnected - you may want to re-home the robot.")
 
-    with ESP32Driver('COM9') as robot:
+    print("=" * 55)
+    print("UGIR L0 - ESP32 Driver Test")
+    print("=" * 55)
 
-        # 1. 归零
-        print("\n[1] 归零...")
-        robot.home()
+    driver = ESP32Driver(
+        port='COM9',
+        max_retries=3,
+        reconnect_attempts=None,   # None = infinite (unattended mode)
+        on_reconnect=on_reconnect
+    )
 
-        # 2. 画第一笔：L形
-        print("\n[2] 画 L 形笔画...")
-        robot.draw_stroke([
-            (0.0,  0.0),
-            (0.0, 30.0),
-            (15.0, 30.0),
-        ], speed=12000)
+    r = driver.connect()
+    print(f"Connect: {r}")
+    if not r.ok:
+        print("Cannot connect. Check COM9 and ESP32 power.")
+        exit(1)
 
-        # 3. 画第二笔：U形（多笔画示例）
-        print("\n[3] 画 U 形（两条线段）...")
-        robot.draw_strokes([
-            [(25.0, 0.0), (25.0, 30.0)],    # 左竖
-            [(40.0, 0.0), (40.0, 30.0)],    # 右竖
-            [(25.0, 30.0), (40.0, 30.0)],   # 底横
-        ], speed=12000)
+    # Home
+    print("\n[1] Homing...")
+    r = driver.home()
+    print(f"    {r}")
 
-        # 4. 查询位置
-        pos = robot.get_position()
-        print(f"\n[4] 当前位置: {pos}")
+    if not r.ok:
+        print("Homing failed. Check limit switches.")
+        driver.disconnect()
+        exit(1)
 
-        # 5. 停靠
-        print("\n[5] 停靠...")
-        robot.pen_park()
+    # Single stroke: L shape
+    print("\n[2] Drawing L shape...")
+    r = driver.draw_stroke([
+        (0.0,  0.0),
+        (0.0, 30.0),
+        (15.0, 30.0),
+    ], speed=12000)
+    print(f"    {r}")
 
-        print("\n✓ 测试完成")
+    # Multiple strokes
+    print("\n[3] Drawing U shape (3 strokes)...")
+    r = driver.draw_strokes([
+        [(25.0, 0.0), (25.0, 30.0)],
+        [(40.0, 0.0), (40.0, 30.0)],
+        [(25.0, 30.0), (40.0, 30.0)],
+    ], speed=12000)
+    print(f"    {r}")
+
+    # Position
+    pos = driver.get_position()
+    print(f"\n[4] Current position: {pos}")
+
+    # Park
+    print("\n[5] Parking...")
+    r = driver.pen_park()
+    print(f"    {r}")
+
+    driver.disconnect()
+    print("\nDone.")
