@@ -1,0 +1,410 @@
+"""
+UGIR L0 反射层 · ESP32 双轴写字机器人驱动
+reflex/esp32_driver.py
+
+设计原则：
+  - 所有动作（包括Z轴）全部通过 TASK 协议发送
+  - 不使用 ZUP / ZDOWN / HOME 单独指令
+  - L0层对上层完全隐藏串口细节
+  - 每个公开方法都是一个「原子反射动作」
+"""
+
+import serial
+import threading
+import time
+import queue
+import logging
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════
+#  数据结构
+# ══════════════════════════════════════════
+
+@dataclass
+class Position:
+    x_mm: float = 0.0
+    y_mm: float = 0.0
+    z_up: bool = True
+
+    def __str__(self):
+        z = "UP" if self.z_up else "DOWN"
+        return f"({self.x_mm:.3f}mm, {self.y_mm:.3f}mm, Z={z})"
+
+
+@dataclass
+class TaskCommand:
+    """单条TASK指令"""
+    type: str          # 'G01' | 'M03' | 'M05' | 'G28' | 'G04'
+    x: float = 0.0    # mm（G01用）
+    y: float = 0.0    # mm（G01用）
+    f: int = 15000    # Hz（G01用）
+    p: int = 0        # ms（G04用）
+
+    def to_str(self) -> str:
+        if self.type == 'G01':
+            return f"G01 X{self.x:.3f} Y{self.y:.3f} F{self.f}"
+        elif self.type == 'G04':
+            return f"G04 P{self.p}"
+        else:
+            return self.type  # M03 / M05 / G28
+
+
+# ══════════════════════════════════════════
+#  ESP32 驱动
+# ══════════════════════════════════════════
+
+class ESP32Driver:
+    """
+    UGIR L0 反射层 · ESP32驱动
+
+    所有动作通过 TASK 协议发送。
+    上层只调用行为原子方法，不接触串口协议。
+
+    用法：
+        driver = ESP32Driver('COM9')
+        driver.connect()
+        driver.home()
+        driver.draw_stroke([(0, 0), (0, 30), (15, 30)])
+        driver.disconnect()
+
+        # 或使用 with 语法：
+        with ESP32Driver('COM9') as robot:
+            robot.home()
+            robot.draw_stroke([(0,0),(0,30)])
+    """
+
+    # ESP32 回复的关键信号
+    _READY_SIGNALS = {'READY', 'RESET_COMPLETE'}
+
+    # 每个TASK最多指令数（ESP32固件限制96，留6条余量）
+    _MAX_CMDS_PER_TASK = 90
+
+    # 默认速度（Hz）
+    DEFAULT_MOVE_SPEED   = 15000   # 书写速度 ≈ 18.75 mm/s
+    DEFAULT_TRAVEL_SPEED = 25000   # 空走速度（笔抬起时）
+
+    def __init__(self, port: str = 'COM9', baud: int = 115200):
+        self.port = port
+        self.baud = baud
+
+        self._ser: Optional[serial.Serial] = None
+        self._rx_queue: queue.Queue = queue.Queue()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._running = False
+
+        self.position = Position()
+        self._task_counter = 0
+
+    # ──────────────────────────────────────
+    #  连接管理
+    # ──────────────────────────────────────
+
+    def connect(self, wait_timeout: float = 15.0) -> 'ESP32Driver':
+        """连接串口，等待ESP32启动完成"""
+        logger.info(f"连接 {self.port} @ {self.baud} baud...")
+        self._ser = serial.Serial(self.port, self.baud, timeout=1)
+        self._running = True
+        self._reader_thread = threading.Thread(
+            target=self._read_loop, daemon=True, name='esp32-reader'
+        )
+        self._reader_thread.start()
+
+        # 等待启动完成（ESP32上电后会打印READY）
+        self._wait_ready(wait_timeout)
+        logger.info("ESP32 已就绪")
+        return self
+
+    def disconnect(self):
+        """断开连接"""
+        self._running = False
+        if self._ser and self._ser.is_open:
+            self._ser.close()
+        logger.info("已断开")
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, *_):
+        self.disconnect()
+
+    # ──────────────────────────────────────
+    #  行为原子（L0 反射动作）
+    #  全部通过 TASK 协议发送
+    # ──────────────────────────────────────
+
+    def home(self):
+        """
+        归零：X/Y轴回到原点，笔抬起。
+        对应TASK内的 G28 指令。
+        """
+        logger.info("执行归零...")
+        cmds = [
+            TaskCommand('M05'),   # 先抬笔，防止划到纸
+            TaskCommand('G28'),   # 归零
+        ]
+        self._send_task(cmds, task_id='home', timeout=90.0)
+        logger.info(f"归零完成，当前位置：{self.position}")
+
+    def move_to(self, x_mm: float, y_mm: float,
+                speed: int = None) -> None:
+        """
+        空走移动（确保笔抬起）到指定坐标。
+        """
+        speed = speed or self.DEFAULT_TRAVEL_SPEED
+        cmds = [
+            TaskCommand('M05'),
+            TaskCommand('G01', x=x_mm, y=y_mm, f=speed),
+        ]
+        self._send_task(cmds, task_id='move')
+
+    def draw_stroke(self,
+                    points: List[Tuple[float, float]],
+                    speed: int = None) -> None:
+        """
+        核心行为原子：画一条完整笔画。
+
+        自动处理全部Z轴控制：
+          抬笔 → 空走到起点 → 落笔 → 依次连线 → 抬笔
+
+        Args:
+            points: [(x_mm, y_mm), ...]  至少需要2个点
+            speed:  书写速度 Hz，默认 15000 (≈18.75 mm/s)
+        """
+        if len(points) < 2:
+            raise ValueError("draw_stroke 需要至少2个点")
+
+        speed = speed or self.DEFAULT_MOVE_SPEED
+        cmds = [
+            TaskCommand('M05'),
+            TaskCommand('G01', x=points[0][0], y=points[0][1],
+                        f=self.DEFAULT_TRAVEL_SPEED),   # 空走到起点
+            TaskCommand('M03'),                          # 落笔
+        ]
+        for pt in points[1:]:
+            cmds.append(TaskCommand('G01', x=pt[0], y=pt[1], f=speed))
+        cmds.append(TaskCommand('M05'))                  # 抬笔
+
+        self._send_task(cmds, task_id='stroke')
+
+    def draw_strokes(self,
+                     strokes: List[List[Tuple[float, float]]],
+                     speed: int = None) -> None:
+        """
+        画多条笔画（自动合并为尽可能少的TASK批次）。
+
+        Args:
+            strokes: [[(x,y),...], [(x,y),...], ...]
+            speed:   书写速度 Hz
+        """
+        speed = speed or self.DEFAULT_MOVE_SPEED
+        all_cmds = []
+
+        for stroke in strokes:
+            if len(stroke) < 2:
+                continue
+            all_cmds.append(TaskCommand('M05'))
+            all_cmds.append(TaskCommand('G01',
+                                        x=stroke[0][0], y=stroke[0][1],
+                                        f=self.DEFAULT_TRAVEL_SPEED))
+            all_cmds.append(TaskCommand('M03'))
+            for pt in stroke[1:]:
+                all_cmds.append(TaskCommand('G01', x=pt[0], y=pt[1], f=speed))
+            all_cmds.append(TaskCommand('M05'))
+
+        self._send_task(all_cmds, task_id='strokes')
+
+    def pen_park(self) -> None:
+        """
+        停靠：笔抬起，回到原点附近安全位置。
+        建议每次任务结束后调用。
+        """
+        cmds = [
+            TaskCommand('M05'),
+            TaskCommand('G01', x=2.0, y=2.0, f=self.DEFAULT_TRAVEL_SPEED),
+        ]
+        self._send_task(cmds, task_id='park')
+
+    def emergency_stop(self):
+        """
+        紧急停止。
+        注意：这是唯一不走TASK协议的方法，因为紧急情况需要立即响应。
+        """
+        logger.warning("紧急停止！")
+        self._send_raw('!')
+        time.sleep(0.1)
+        # 清空接收队列
+        while not self._rx_queue.empty():
+            try:
+                self._rx_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def get_position(self) -> Position:
+        """查询当前位置（POS指令，立即返回）"""
+        self._send_raw('POS')
+        time.sleep(0.2)   # 等串口回复被_read_loop解析
+        return self.position
+
+    # ──────────────────────────────────────
+    #  TASK 发送引擎（内部）
+    # ──────────────────────────────────────
+
+    def _send_task(self, cmds: List[TaskCommand],
+                   task_id: str = 'task',
+                   timeout: float = 120.0):
+        """
+        将指令列表自动分块，逐批发送为TASK，
+        每批等待READY后再发下一批。
+        """
+        if not cmds:
+            return
+
+        self._task_counter += 1
+        base_id = f"{task_id}_{self._task_counter}"
+
+        # 按 _MAX_CMDS_PER_TASK 分块
+        chunks = [
+            cmds[i:i + self._MAX_CMDS_PER_TASK]
+            for i in range(0, len(cmds), self._MAX_CMDS_PER_TASK)
+        ]
+
+        for ci, chunk in enumerate(chunks):
+            tid = f"{base_id}_p{ci}" if len(chunks) > 1 else base_id
+
+            # 拼装协议字符串
+            parts = [f"TASK {tid} {len(chunk)}"]
+            for cmd in chunk:
+                parts.append(cmd.to_str())
+            raw = ' '.join(parts)
+
+            logger.debug(f"→ [{len(chunk)}条] {tid}")
+            self._send_raw(raw)
+            self._wait_ready(timeout)
+
+    # ──────────────────────────────────────
+    #  串口底层（内部）
+    # ──────────────────────────────────────
+
+    def _send_raw(self, cmd: str):
+        """直接发送原始字符串（加换行符）"""
+        if not self._ser or not self._ser.is_open:
+            raise RuntimeError("串口未连接")
+        self._ser.write((cmd + '\n').encode('utf-8'))
+        logger.debug(f"→ RAW: {cmd[:80]}{'...' if len(cmd)>80 else ''}")
+
+    def _read_loop(self):
+        """后台线程：持续读取串口，解析关键信号并推入队列"""
+        while self._running:
+            try:
+                raw = self._ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+
+                logger.debug(f"← {line}")
+
+                # 自动解析位置信息
+                if line.startswith('POS '):
+                    self._parse_position(line)
+
+                self._rx_queue.put(line)
+
+            except serial.SerialException as e:
+                if self._running:
+                    logger.error(f"串口异常: {e}")
+                break
+            except Exception as e:
+                logger.warning(f"读取异常: {e}")
+
+    def _wait_ready(self, timeout: float = 30.0):
+        """
+        阻塞等待 READY 信号。
+        遇到 ERROR 或 EMERGENCY_STOP 立即抛出异常。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                line = self._rx_queue.get(timeout=0.5)
+                if line in self._READY_SIGNALS:
+                    return
+                if line.startswith('ERROR'):
+                    raise RuntimeError(f"ESP32 报错: {line}")
+                if 'EMERGENCY_STOP' in line:
+                    raise RuntimeError("紧急停止触发")
+            except queue.Empty:
+                continue
+        raise TimeoutError(f"等待 READY 超时（{timeout}s）")
+
+    def _parse_position(self, line: str):
+        """
+        解析 POS 回复，更新 self.position
+        ESP32格式：POS X:800(1.000mm) Y:1600(2.000mm) Z:UP(0°) Angle:0
+        """
+        try:
+            xi = line.index('(', line.index('X:')) + 1
+            xj = line.index('mm)', xi)
+            x = float(line[xi:xj])
+
+            yi = line.index('(', line.index('Y:')) + 1
+            yj = line.index('mm)', yi)
+            y = float(line[yi:yj])
+
+            z_up = 'Z:UP' in line
+
+            self.position = Position(x_mm=x, y_mm=y, z_up=z_up)
+        except Exception:
+            pass  # 解析失败不影响主流程
+
+
+# ══════════════════════════════════════════
+#  快速测试入口
+#  python esp32_driver.py
+# ══════════════════════════════════════════
+
+if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s'
+    )
+
+    print("=" * 50)
+    print("UGIR L0 · ESP32 驱动测试")
+    print("=" * 50)
+
+    with ESP32Driver('COM9') as robot:
+
+        # 1. 归零
+        print("\n[1] 归零...")
+        robot.home()
+
+        # 2. 画第一笔：L形
+        print("\n[2] 画 L 形笔画...")
+        robot.draw_stroke([
+            (0.0,  0.0),
+            (0.0, 30.0),
+            (15.0, 30.0),
+        ], speed=12000)
+
+        # 3. 画第二笔：U形（多笔画示例）
+        print("\n[3] 画 U 形（两条线段）...")
+        robot.draw_strokes([
+            [(25.0, 0.0), (25.0, 30.0)],    # 左竖
+            [(40.0, 0.0), (40.0, 30.0)],    # 右竖
+            [(25.0, 30.0), (40.0, 30.0)],   # 底横
+        ], speed=12000)
+
+        # 4. 查询位置
+        pos = robot.get_position()
+        print(f"\n[4] 当前位置: {pos}")
+
+        # 5. 停靠
+        print("\n[5] 停靠...")
+        robot.pen_park()
+
+        print("\n✓ 测试完成")
